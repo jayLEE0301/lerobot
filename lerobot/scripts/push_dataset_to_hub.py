@@ -48,6 +48,17 @@ python lerobot/scripts/push_dataset_to_hub.py \
 --save-to-disk 1 \
 --save-tests-to-disk 0 \
 --debug 1
+
+python lerobot/scripts/push_dataset_to_hub.py \
+--data-dir data \
+--dataset-id franka_kitchen \
+--raw-format franka_kitchen_npy \
+--community-id lerobot \
+--revision v1.2 \
+--dry-run 1 \
+--save-to-disk 1 \
+--save-tests-to-disk 0 \
+--debug 1
 ```
 """
 
@@ -75,6 +86,8 @@ def get_from_raw_to_lerobot_format_fn(raw_format):
         from lerobot.common.datasets.push_dataset_to_hub.aloha_hdf5_format import from_raw_to_lerobot_format
     elif raw_format == "xarm_pkl":
         from lerobot.common.datasets.push_dataset_to_hub.xarm_pkl_format import from_raw_to_lerobot_format
+    elif raw_format == "franka_kitchen_npy":
+        from lerobot.common.datasets.push_dataset_to_hub.franka_kitchen_npy_format import from_raw_to_lerobot_format
     else:
         raise ValueError(raw_format)
 
@@ -236,12 +249,12 @@ def main():
         "--dataset-id",
         type=str,
         required=True,
-        help="Name of the dataset (e.g. `pusht`, `aloha_sim_insertion_human`), which matches the folder where the data is stored (e.g. `data/pusht`).",
+        help="Name of the dataset (e.g. `pusht`, `aloha_sim_insertion_human`, `franka_kitchen`), which matches the folder where the data is stored (e.g. `data/pusht`).",
     )
     parser.add_argument(
         "--raw-format",
         type=str,
-        help="Dataset type (e.g. `pusht_zarr`, `umi_zarr`, `aloha_hdf5`, `xarm_pkl`). If not provided, will be detected automatically.",
+        help="Dataset type (e.g. `pusht_zarr`, `umi_zarr`, `aloha_hdf5`, `xarm_pkl`, `franka_kitchen_npy`). If not provided, will be detected automatically.",
     )
     parser.add_argument(
         "--community-id",
