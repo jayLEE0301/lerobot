@@ -109,7 +109,7 @@ class VQBeTPolicy(nn.Module, PyTorchModelHubMixin):
             loss, n_different_codes, n_different_combinations = self.vqbet.discretize(self.config.n_vqvae_training_steps, batch['action'])
             return {"loss": loss, "n_different_codes": n_different_codes, "n_different_combinations": n_different_combinations}
         # if Residual VQ is already trained, VQ-BeT trains its GPT and bin prediction head / offset prediction head parts.
-        _, loss_dict = self.vqbet(batch, rollout=False)
+        loss_dict = self.vqbet(batch, rollout=False)
 
         return loss_dict
 
@@ -249,7 +249,8 @@ class VQBeTModel(nn.Module):
 
         # This action query token is used as a prompt for querying action chunks. Please refer to "A_Q" in the image above.
         # Note: During the forward pass, this token is repeated as many times as needed. The authors also experimented with initializing the necessary number of tokens independently and observed inferior results.
-        self._action_token = nn.Parameter(torch.randn(1, 1, self.config.gpt_input_dim))
+        self._action_token = nn.Parameter(torch.randn(1, 1, config.vqvae_groups+1, self.config.gpt_input_dim))
+        self._code_to_token = nn.Parameter(torch.randn(self.config.vqvae_n_embed, self.config.gpt_input_dim))
 
         # To input state and observation features into GPT layers, we first project the features to fit the shape of input size of GPT.
         self.state_projector = MLP(
@@ -293,41 +294,80 @@ class VQBeTModel(nn.Module):
         rgb_tokens = self.rgb_feature_projector(img_features)  # (batch, obs_step, d)
         state_tokens = self.state_projector(batch["observation.state"])  # (batch, obs_step, d)
         history_action_tokens = einops.repeat(
-            self._action_token, "1 1 d -> b n d", b=batch_size, n=n_obs_steps
+            self._action_token, "1 1 g d -> b n g d", b=batch_size, n=n_obs_steps
         )
-        # Interleave tokens by stacking and rearranging.
-        input_tokens = torch.stack([rgb_tokens, state_tokens, history_action_tokens], dim=2)
-        input_tokens = einops.rearrange(input_tokens, "b n t d -> b (n t) d")
+        if not rollout:
+            # get GT action codes
+            action_seq = batch["action"][:, self.select_target_actions_indices]
+            action_seq = einops.rearrange(action_seq, "N T W A -> (N T) W A")
+            # Figure out the loss for the actions.
+            # First, we need to find the closest cluster center for each ground truth action.
+            with torch.no_grad():
+                state_vq, action_bins, reqired_offset = self.action_head.vqvae_model.get_code(
+                    action_seq
+                )  # action_bins: NT, G
+                # state_vq = einops.rearrange(state_vq, "(N T) D -> N T D", N=batch_size)
+                # action_bins = action_bins.flatten()
+                code_tokens = self._code_to_token[action_bins] # (batch x obs_step, vq group num, d)
+                code_tokens = einops.rearrange(code_tokens, "(N T) G D -> N T G D", N=batch_size) # (batch, obs_step, vq group num, d)
 
-        len_additional_action_token = self.config.n_action_pred_token-1
-        future_action_tokens = self._action_token.repeat(batch_size, len_additional_action_token, 1)
 
-        # add additional action query tokens for predicting future action chunks
-        input_tokens = torch.cat([input_tokens, future_action_tokens], dim=1)
+        # len_additional_action_token = self.config.n_action_pred_token-1
+        # future_action_tokens = self._action_token.repeat(batch_size, len_additional_action_token, 1)
+        if rollout:
+            code_tokens = torch.zeros((batch_size, n_obs_steps, 0, self.config.vqvae_embedding_dim)).to(get_device_from_parameters(self))
+            sampled_centers_stack = torch.zeros((batch_size * n_obs_steps, 0)).to(get_device_from_parameters(self))
+        if not rollout:
+            total_loss = 0
+        for i in range(self.config.vqvae_groups + 1):
+            # Interleave tokens by stacking and rearranging.
+            input_tokens = torch.cat([
+                torch.unsqueeze(rgb_tokens, dim=2), # (batch, obs_step, 1, d) 
+                torch.unsqueeze(state_tokens, dim=2), # (batch, obs_step, 1, d) 
+                code_tokens[..., :i, :], # (batch, obs_step, i, d) 
+                history_action_tokens[..., i:, :] # (batch, obs_step, vq group num-i, d) 
+                ], dim=2) # (batch, obs_step, vq group num + self.config.input_shapes, d) 
+            input_tokens = einops.rearrange(input_tokens, "b n t d -> b (n t) d")
+
+            # get action features (pass through GPT)
+            features = self.policy(input_tokens)
+
+            # only extract the output tokens at the position of action query:
+            act_pred_index = np.arange(0, n_obs_steps) * (len(self.config.input_shapes)+self.config.vqvae_groups+1) + len(self.config.input_shapes) + i
+            features = features[:, act_pred_index]
 
         
-        # get action features (pass through GPT)
-        features = self.policy(input_tokens)
-        # len(self.config.input_shapes) is the number of different observation modes. this line gets the index of action prompt tokens.
-        historical_act_pred_index = np.arange(0, n_obs_steps) * (len(self.config.input_shapes)+1) + len(self.config.input_shapes)
+            # pass through action head
+            pred_logit_and_offset = self.action_head(features)
 
-        # only extract the output tokens at the position of action query:
-        # Behavior Transformer (BeT), and VQ-BeT are both sequence-to-sequence prediction models, mapping sequential observation to sequential action (please refer to section 2.2 in BeT paper https://arxiv.org/pdf/2206.11251).
-        # Thus, it predict historical action sequence, in addition to current and future actions (predicting future actions : optional).
-        features = torch.cat([
-            features[:, historical_act_pred_index],
-            features[:, -len_additional_action_token:]
-        ], dim=1)
-        # pass through action head
-        pred_action = self.action_head(features)
-        # if rollout, VQ-BeT don't calculate loss
-        if rollout:
-            return pred_action["predicted_action"][:, n_obs_steps-1, :].reshape(batch_size, self.config.action_chunk_size, -1)
-        # else, it calculate overall loss (bin prediction loss, and offset loss)
-        else:
-            output = batch["action"][:, self.select_target_actions_indices]
-            loss = self.action_head.loss_fn(pred_action, output, reduction="mean")
-            return pred_action, loss
+            if i < self.config.vqvae_groups:
+                if rollout:
+                    sampled_centers = einops.rearrange(pred_logit_and_offset["sampled_centers"], "(N T) 1 -> N T 1", N=batch_size)
+                    sampled_centers_stack = torch.cat([sampled_centers_stack, pred_logit_and_offset["sampled_centers"]], dim=1)
+                    # return_decoder_input = self.action_head.vqvae_model.get_embeddings_from_code(sampled_centers).clone().detach()
+                    code_tokens = torch.cat([code_tokens, self._code_to_token[sampled_centers]], dim=2)
+                else:
+                    total_loss += self.action_head._focal_loss_fn(
+                                    pred_logit_and_offset["cbet_logits"],
+                                    action_bins[:, i],
+                                )
+            else:
+                if rollout:
+                    return_decoder_input = self.action_head.vqvae_model.get_embeddings_from_code(sampled_centers_stack.long()).clone().detach() # (batch x obs_step, d)
+                    decoded_action = (self.action_head.vqvae_model.get_action_from_latent(return_decoder_input).clone().detach())
+                    predicted_action =  pred_logit_and_offset["cbet_offsets"].reshape(batch_size, n_obs_steps, self.config.action_chunk_size, -1) + decoded_action.reshape(batch_size, n_obs_steps, self.config.action_chunk_size, -1)
+                    return predicted_action[:, -1, :, :]
+                else:
+                    total_loss += F.l1_loss(reqired_offset, pred_logit_and_offset["cbet_offsets"])
+                    return {"loss": total_loss}
+        # # if rollout, VQ-BeT don't calculate loss
+        # if rollout:
+        #     return pred_action["predicted_action"][:, n_obs_steps-1, :].reshape(batch_size, self.config.action_chunk_size, -1)
+        # # else, it calculate overall loss (bin prediction loss, and offset loss)
+        # else:
+        #     output = batch["action"][:, self.select_target_actions_indices]
+        #     loss = self.action_head.loss_fn(pred_action, output, reduction="mean")
+        #     return pred_action, loss
 
 
 class VQBeTHead(nn.Module):
@@ -360,12 +400,12 @@ class VQBeTHead(nn.Module):
         else:
             self.map_to_cbet_preds_bin = MLP(
                 in_channels=config.gpt_output_dim,
-                hidden_channels=[self.config.vqvae_groups * self.config.vqvae_n_embed],
+                hidden_channels=[self.config.vqvae_n_embed],
             )
         self.map_to_cbet_preds_offset = MLP(
             in_channels=config.gpt_output_dim,
             hidden_channels=[
-                self.config.vqvae_groups * self.config.vqvae_n_embed * config.action_chunk_size * config.output_shapes["action"][0],
+                config.action_chunk_size * config.output_shapes["action"][0],
             ],
         )
         # init vqvae
@@ -386,9 +426,9 @@ class VQBeTHead(nn.Module):
 
         # sample offsets
         cbet_offsets = self.map_to_cbet_preds_offset(x)
-        cbet_offsets = einops.rearrange(
-            cbet_offsets, "(NT) (G C WA) -> (NT) G C WA", G=self.config.vqvae_groups, C=self.config.vqvae_n_embed
-        )
+        # cbet_offsets = einops.rearrange(
+        #     cbet_offsets, "(NT) (G C WA) -> (NT) G C WA", G=self.config.vqvae_groups, C=self.config.vqvae_n_embed
+        # )
         # if self.config.sequentially_select is True, bin prediction head first sample the primary code, and then sample secondary code
         if self.config.sequentially_select:
             cbet_primary_logits = self.map_to_cbet_preds_primary_bin(x)
@@ -420,56 +460,51 @@ class VQBeTHead(nn.Module):
             cbet_logits = torch.stack([cbet_primary_logits, cbet_secondary_logits], dim=1)
         # if self.config.sequentially_select is False, bin prediction head samples primary and secondary code at once.
         else:
-            cbet_logits = self.map_to_cbet_preds_bin(x)
-            cbet_logits = einops.rearrange(
-                cbet_logits, "(NT) (G C) -> (NT) G C", G=self.config.vqvae_groups
-            )
-            cbet_probs = torch.softmax(cbet_logits / self.config.bet_softmax_temperature, dim=-1)
-            NT, G, choices = cbet_probs.shape
-            sampled_centers = einops.rearrange(
-                torch.multinomial(cbet_probs.view(-1, choices), num_samples=1),
-                "(NT G) 1 -> NT G",
-                NT=NT,
-            )
+            cbet_logits = self.map_to_cbet_preds_bin(x) # (NT) C
+            # cbet_logits = einops.rearrange(
+            #     cbet_logits, "(NT) (G C) -> (NT) G C", G=self.config.vqvae_groups
+            # )
+            cbet_probs = torch.softmax(cbet_logits / self.config.bet_softmax_temperature, dim=-1) # (NT) C
+            NT, choices = cbet_probs.shape
+            sampled_centers = torch.multinomial(cbet_probs.view(-1, choices), num_samples=1)
             
-        device = get_device_from_parameters(self)
-        indices = (
-            torch.arange(NT, device=device).unsqueeze(1),
-            torch.arange(self.config.vqvae_groups, device=device).unsqueeze(0),
-            sampled_centers,
-        )
-        # Use advanced indexing to sample the values (Extract the only offsets corresponding to the sampled codes.)
-        sampled_offsets = cbet_offsets[indices]
-        # Then, sum the offsets over the RVQ layers to get a net offset for the bin prediction
-        sampled_offsets = sampled_offsets.sum(dim=1)
-        with torch.no_grad():
-            # Get the centroids (= vectors corresponding to the codes) of each layer to pass it through RVQ decoder
-            return_decoder_input = self.vqvae_model.get_embeddings_from_code(sampled_centers).clone().detach()
-            # pass the centroids through decoder to get actions.
-            decoded_action = (
-                self.vqvae_model.get_action_from_latent(return_decoder_input)
-                .clone()
-                .detach()
-            )
-        # reshaped extracted offset to match with decoded centroids
-        sampled_offsets = einops.rearrange(
-            sampled_offsets, "NT (W A) -> NT W A", W=self.config.action_chunk_size
-        )
-        # add offset and decoded centroids
-        predicted_action = decoded_action + sampled_offsets
-        predicted_action = einops.rearrange(
-            predicted_action,
-            "(N T) W A -> N T (W A)",
-            N=N,
-            T=T,
-            W=self.config.action_chunk_size,
-        )
+        # device = get_device_from_parameters(self)
+        # indices = (
+        #     torch.arange(NT, device=device).unsqueeze(1),
+        #     torch.arange(self.config.vqvae_groups, device=device).unsqueeze(0),
+        #     sampled_centers,
+        # )
+        # # Use advanced indexing to sample the values (Extract the only offsets corresponding to the sampled codes.)
+        # sampled_offsets = cbet_offsets[indices]
+        # # Then, sum the offsets over the RVQ layers to get a net offset for the bin prediction
+        # sampled_offsets = sampled_offsets.sum(dim=1)
+        # with torch.no_grad():
+        #     # Get the centroids (= vectors corresponding to the codes) of each layer to pass it through RVQ decoder
+        #     return_decoder_input = self.vqvae_model.get_embeddings_from_code(sampled_centers).clone().detach()
+        #     # pass the centroids through decoder to get actions.
+        #     decoded_action = (
+        #         self.vqvae_model.get_action_from_latent(return_decoder_input)
+        #         .clone()
+        #         .detach()
+        #     )
+        # # reshaped extracted offset to match with decoded centroids
+        # sampled_offsets = einops.rearrange(
+        #     sampled_offsets, "NT (W A) -> NT W A", W=self.config.action_chunk_size
+        # )
+        # # add offset and decoded centroids
+        # predicted_action = decoded_action + sampled_offsets
+        # predicted_action = einops.rearrange(
+        #     predicted_action,
+        #     "(N T) W A -> N T (W A)",
+        #     N=N,
+        #     T=T,
+        #     W=self.config.action_chunk_size,
+        # )
 
         return {
             "cbet_logits": cbet_logits,
-            "predicted_action": predicted_action,
             "sampled_centers": sampled_centers,
-            "decoded_action": decoded_action, 
+            "cbet_offsets": cbet_offsets, 
         }
 
     def loss_fn(self, pred, target, **kwargs):
@@ -563,6 +598,7 @@ class VQBeTOptimizer(torch.optim.Adam):
             + list(policy.vqbet.state_projector.parameters())
             + list(policy.vqbet.rgb_feature_projector.parameters())
             + [policy.vqbet._action_token]
+            + [policy.vqbet._code_to_token]
             + list(policy.vqbet.action_head.map_to_cbet_preds_offset.parameters())
         )
 
@@ -801,7 +837,8 @@ class VqVae(nn.Module):
             state_vq = state_rep_flat.view(*state_rep_shape, -1)
             vq_code = vq_code.view(*state_rep_shape, -1)
             vq_loss_state = torch.sum(vq_loss_state)
-            return state_vq, vq_code
+            recon_state = self.decoder(state_vq)
+            return state_vq, vq_code, (state-recon_state)
 
     def vqvae_forward(self, state):
         # This function passes the given data through Residual VQ with Encoder and Decoder. Please refer to section 3.2 in the paper https://arxiv.org/pdf/2403.03181).
