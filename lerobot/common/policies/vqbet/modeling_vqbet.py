@@ -596,12 +596,19 @@ class VQBeTHead(nn.Module):
         }
         return loss_dict
 
-class VQBeTOptimizer(torch.optim.Adam):
+class VQBeTOptimizer(nn.Module):
     def __init__(self, policy, cfg):
+        self.n_vqvae_training_steps = cfg.training.n_vqvae_training_steps
+        self.optimizing_step = 0
+
+
         vqvae_params = (
             list(policy.vqbet.action_head.vqvae_model.encoder.parameters())
             + list(policy.vqbet.action_head.vqvae_model.decoder.parameters())
             + list(policy.vqbet.action_head.vqvae_model.vq_layer.parameters())
+        )
+        self.vqvae_optimizer = torch.optim.Adam(
+            vqvae_params, lr=cfg.training.vqvae_lr, weight_decay=0.0001
         )
         decay_params, no_decay_params = policy.vqbet.policy.configure_parameters()
         decay_params = (
@@ -632,23 +639,40 @@ class VQBeTOptimizer(torch.optim.Adam):
                 "weight_decay": cfg.training.adam_weight_decay,
                 "lr": cfg.training.lr,
             },
-            {
-                "params": vqvae_params,
-                "weight_decay": 0.0001,
-                "lr": cfg.training.vqvae_lr,
-            },
+            # {
+            #     "params": vqvae_params,
+            #     "weight_decay": 0.0001,
+            #     "lr": cfg.training.vqvae_lr,
+            # },
             {
                 "params": no_decay_params,
                 "weight_decay": 0.0,
                 "lr": cfg.training.lr,
             },
         ]
-        super(VQBeTOptimizer, self).__init__(
+        self.second_optimizer = torch.optim.Adam(
             optim_groups,
             cfg.training.lr,
             cfg.training.adam_betas,
             cfg.training.adam_eps,
         )
+        self.param_groups = self.second_optimizer.param_groups
+    def step(self):
+        self.optimizing_step +=1
+        # pretraining VQ-VAE (Training Phase 1)
+        if self.optimizing_step < self.n_vqvae_training_steps:
+            self.vqvae_optimizer.step()
+        # training BeT (Training Phase 2)
+        else:
+            self.second_optimizer.step()
+
+    def zero_grad(self):
+        # pretraining VQ-VAE (Training Phase 1)
+        if self.optimizing_step < self.n_vqvae_training_steps:
+            self.vqvae_optimizer.zero_grad()
+        # training BeT (Training Phase 2)
+        else:
+            self.second_optimizer.zero_grad()
 
 class VQBeTScheduler(nn.Module):
     def __init__(self, optimizer, cfg):
@@ -660,7 +684,7 @@ class VQBeTScheduler(nn.Module):
 
         self.lr_scheduler = get_scheduler(
             cfg.training.lr_scheduler,
-            optimizer=optimizer,
+            optimizer=optimizer.second_optimizer,
             num_warmup_steps=cfg.training.lr_warmup_steps,
             num_training_steps=cfg.training.offline_steps,
         )
