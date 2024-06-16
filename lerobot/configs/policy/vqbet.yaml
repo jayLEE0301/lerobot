@@ -20,10 +20,10 @@ override_dataset_stats:
     max: [511.0, 511.0]
 
 training:
-  offline_steps: 250000
+  offline_steps: 400000
   online_steps: 0
-  eval_freq: 40000
-  save_freq: 40000
+  eval_freq: 20000
+  save_freq: 200000
   log_freq: 250
   save_checkpoint: true
 
@@ -39,7 +39,7 @@ training:
 
   # VQ-BeT specific
   vqvae_lr: 1.0e-3
-  n_vqvae_training_steps: 40000
+  n_vqvae_training_steps: 20000
   bet_weight_decay: 2e-4
   bet_learning_rate: 5.5e-5
   bet_betas: [0.9, 0.999]
@@ -85,7 +85,7 @@ policy:
   spatial_softmax_num_keypoints: 32
   # VQ-VAE
   n_vqvae_training_steps: ${training.n_vqvae_training_steps}
-  vqvae_groups: 6
+  vqvae_groups: 2
   vqvae_n_embed: 16
   vqvae_embedding_dim: 512
   vqvae_enc_hidden_dim: 128
