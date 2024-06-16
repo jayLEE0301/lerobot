@@ -598,6 +598,7 @@ class VQBeTHead(nn.Module):
 
 class VQBeTOptimizer(nn.Module):
     def __init__(self, policy, cfg):
+        super().__init__()
         self.n_vqvae_training_steps = cfg.training.n_vqvae_training_steps
         self.optimizing_step = 0
 
