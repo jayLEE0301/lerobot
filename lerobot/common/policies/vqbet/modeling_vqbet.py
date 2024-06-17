@@ -320,6 +320,7 @@ class VQBeTModel(nn.Module):
         if not rollout:
             total_loss = 0
             equal_code_rate = []
+            sampled_centers_stack = torch.zeros((batch_size * n_obs_steps, 0)).to(get_device_from_parameters(self))
         for i in range(self.config.vqvae_groups + 1):
             # Interleave tokens by stacking and rearranging.
             input_tokens = torch.cat([
@@ -352,6 +353,7 @@ class VQBeTModel(nn.Module):
                                     pred_logit_and_offset["cbet_logits"],
                                     action_bins[:, i],
                                 )
+                    sampled_centers_stack = torch.cat([sampled_centers_stack, pred_logit_and_offset["sampled_centers"]], dim=1)
                     # sampled_centers = einops.rearrange(pred_logit_and_offset["sampled_centers"], "(N T) 1 -> N T 1", N=batch_size)
                     equal_code_rate.append(torch.sum(
                                                 (action_bins[:, i] ==  pred_logit_and_offset["sampled_centers"].flatten()).int()
@@ -367,8 +369,14 @@ class VQBeTModel(nn.Module):
                     return_dicts = {"loss": total_loss}
                     for i in range(self.config.vqvae_groups):
                         return_dicts["equal_code_rate_{}th".format(i)] = equal_code_rate[i].detach().cpu().item()
-                    vq_action_error = torch.mean(torch.abs(reqired_offset))
-                    offset_action_error = torch.mean(torch.abs(reqired_offset - pred_logit_and_offset["cbet_offsets"]))
+                    # vq_action_error = torch.mean(torch.abs(reqired_offset))
+                    # offset_action_error = torch.mean(torch.abs(reqired_offset - pred_logit_and_offset["cbet_offsets"]))
+                    return_decoder_input = self.action_head.vqvae_model.get_embeddings_from_code(sampled_centers_stack.long()).clone().detach() # (batch x obs_step, d)
+                    decoded_action = (self.action_head.vqvae_model.get_action_from_latent(return_decoder_input).clone().detach())
+                    # decoded_action = decoded_action.reshape(batch_size * n_obs_steps, self.config.action_chunk_size, -1)
+                    vq_action_error = torch.mean(torch.abs(action_seq - decoded_action))
+                    predicted_action =  pred_logit_and_offset["cbet_offsets"].reshape(batch_size * n_obs_steps, self.config.action_chunk_size, -1) + decoded_action
+                    offset_action_error = torch.mean(torch.abs(action_seq - predicted_action))
                     return_dicts["vq_action_error"]= vq_action_error.detach().cpu().item()
                     return_dicts["offset_action_error"]= offset_action_error.detach().cpu().item()
                     return return_dicts
