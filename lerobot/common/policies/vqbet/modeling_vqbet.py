@@ -377,7 +377,7 @@ class VQBeTModel(nn.Module):
                     vq_action_error = torch.mean(torch.abs(action_seq - decoded_action))
                     
                     total_loss += F.l1_loss(action_seq, predicted_action)
-                    return_dicts = {"loss": total_loss}
+                    return_dicts["loss"] = total_loss
                     offset_action_error = torch.mean(torch.abs(action_seq - predicted_action))
                     return_dicts["vq_action_error"]= vq_action_error.detach().cpu().item()
                     return_dicts["offset_action_error"]= offset_action_error.detach().cpu().item()
