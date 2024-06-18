@@ -249,7 +249,7 @@ class VQBeTModel(nn.Module):
 
         # This action query token is used as a prompt for querying action chunks. Please refer to "A_Q" in the image above.
         # Note: During the forward pass, this token is repeated as many times as needed. The authors also experimented with initializing the necessary number of tokens independently and observed inferior results.
-        self._action_token = nn.Parameter(torch.randn(1, 1, config.vqvae_groups, self.config.gpt_input_dim))
+        self._action_token = nn.Parameter(torch.randn(1, 1, config.vqvae_groups+1, self.config.gpt_input_dim))
         self._code_to_token = nn.Parameter(torch.randn(self.config.vqvae_n_embed, self.config.gpt_input_dim))
 
         # To input state and observation features into GPT layers, we first project the features to fit the shape of input size of GPT.
@@ -314,14 +314,14 @@ class VQBeTModel(nn.Module):
 
         # len_additional_action_token = self.config.n_action_pred_token-1
         # future_action_tokens = self._action_token.repeat(batch_size, len_additional_action_token, 1)
-        sampled_centers_stack = torch.zeros((batch_size * n_obs_steps, 0)).to(get_device_from_parameters(self))
-        sampled_offsets_stack = torch.zeros((batch_size * n_obs_steps, 0, self.config.action_chunk_size * self.config.output_shapes["action"][0])).to(get_device_from_parameters(self))
         if rollout:
             code_tokens = torch.zeros((batch_size, n_obs_steps, 0, self.config.vqvae_embedding_dim)).to(get_device_from_parameters(self))
+            sampled_centers_stack = torch.zeros((batch_size * n_obs_steps, 0)).to(get_device_from_parameters(self))
         if not rollout:
             total_loss = 0
             equal_code_rate = []
-        for i in range(self.config.vqvae_groups):
+            sampled_centers_stack = torch.zeros((batch_size * n_obs_steps, 0)).to(get_device_from_parameters(self))
+        for i in range(self.config.vqvae_groups + 1):
             # Interleave tokens by stacking and rearranging.
             input_tokens = torch.cat([
                 torch.unsqueeze(rgb_tokens, dim=2), # (batch, obs_step, 1, d) 
@@ -335,49 +335,47 @@ class VQBeTModel(nn.Module):
             features = self.policy(input_tokens)
 
             # only extract the output tokens at the position of action query:
-            act_pred_index = np.arange(0, n_obs_steps) * (len(self.config.input_shapes)+self.config.vqvae_groups) + len(self.config.input_shapes) + i
+            act_pred_index = np.arange(0, n_obs_steps) * (len(self.config.input_shapes)+self.config.vqvae_groups+1) + len(self.config.input_shapes) + i
             features = features[:, act_pred_index]
 
         
             # pass through action head
             pred_logit_and_offset = self.action_head(features)
 
-            sampled_centers_stack = torch.cat([sampled_centers_stack, pred_logit_and_offset["sampled_centers"]], dim=1)
-            # option 1: using gt code for offset training
-            sampled_offsets_stack =  torch.cat([sampled_offsets_stack, pred_logit_and_offset["sampled_offsets"]], dim=1)
-
-            if rollout:
-                sampled_centers = einops.rearrange(pred_logit_and_offset["sampled_centers"], "(N T) 1 -> N T 1", N=batch_size)
-                code_tokens = torch.cat([code_tokens, self._code_to_token[sampled_centers]], dim=2)
-            else:
-                total_loss += self.action_head._focal_loss_fn(
-                                pred_logit_and_offset["cbet_logits"],
-                                action_bins[:, i],
-                            )
-
-                equal_code_rate.append(torch.sum(
-                                            (action_bins[:, i] ==  pred_logit_and_offset["sampled_centers"].flatten()).int()
-                                        ) / (batch_size * n_obs_steps))
-            
-            if i == self.config.vqvae_groups-1:
-                return_decoder_input = self.action_head.vqvae_model.get_embeddings_from_code(sampled_centers_stack.long()).clone().detach() # (batch x obs_step, d)
-                decoded_action = (self.action_head.vqvae_model.get_action_from_latent(return_decoder_input).clone().detach())
-                sampled_offsets_stack = sampled_offsets_stack.sum(1).reshape(batch_size, n_obs_steps, self.config.action_chunk_size, -1)
-                predicted_action =  sampled_offsets_stack + decoded_action.reshape(batch_size, n_obs_steps, self.config.action_chunk_size, -1)
+            if i < self.config.vqvae_groups:
                 if rollout:
+                    sampled_centers = einops.rearrange(pred_logit_and_offset["sampled_centers"], "(N T) 1 -> N T 1", N=batch_size)
+                    sampled_centers_stack = torch.cat([sampled_centers_stack, pred_logit_and_offset["sampled_centers"]], dim=1)
+                    # return_decoder_input = self.action_head.vqvae_model.get_embeddings_from_code(sampled_centers).clone().detach()
+                    code_tokens = torch.cat([code_tokens, self._code_to_token[sampled_centers]], dim=2)
+                else:
+                    total_loss += self.action_head._focal_loss_fn(
+                                    pred_logit_and_offset["cbet_logits"],
+                                    action_bins[:, i],
+                                )
+                    sampled_centers_stack = torch.cat([sampled_centers_stack, pred_logit_and_offset["sampled_centers"]], dim=1)
+                    # sampled_centers = einops.rearrange(pred_logit_and_offset["sampled_centers"], "(N T) 1 -> N T 1", N=batch_size)
+                    equal_code_rate.append(torch.sum(
+                                                (action_bins[:, i] ==  pred_logit_and_offset["sampled_centers"].flatten()).int()
+                                            ) / (batch_size * n_obs_steps))
+            else:
+                if rollout:
+                    return_decoder_input = self.action_head.vqvae_model.get_embeddings_from_code(sampled_centers_stack.long()).clone().detach() # (batch x obs_step, d)
+                    decoded_action = (self.action_head.vqvae_model.get_action_from_latent(return_decoder_input).clone().detach())
+                    predicted_action =  pred_logit_and_offset["cbet_offsets"].reshape(batch_size, n_obs_steps, self.config.action_chunk_size, -1) + decoded_action.reshape(batch_size, n_obs_steps, self.config.action_chunk_size, -1)
                     return predicted_action[:, -1, :, :]
                 else:
-                    return_dicts = {}
+                    total_loss += F.l1_loss(reqired_offset, pred_logit_and_offset["cbet_offsets"]) * 100
+                    return_dicts = {"loss": total_loss}
                     for i in range(self.config.vqvae_groups):
                         return_dicts["equal_code_rate_{}th".format(i)] = equal_code_rate[i].detach().cpu().item()
                     # vq_action_error = torch.mean(torch.abs(reqired_offset))
                     # offset_action_error = torch.mean(torch.abs(reqired_offset - pred_logit_and_offset["cbet_offsets"]))
-                    decoded_action = decoded_action.reshape(batch_size, n_obs_steps, self.config.action_chunk_size, -1)
-                    action_seq = action_seq.reshape(batch_size, n_obs_steps, self.config.action_chunk_size, -1)
+                    return_decoder_input = self.action_head.vqvae_model.get_embeddings_from_code(sampled_centers_stack.long()).clone().detach() # (batch x obs_step, d)
+                    decoded_action = (self.action_head.vqvae_model.get_action_from_latent(return_decoder_input).clone().detach())
+                    # decoded_action = decoded_action.reshape(batch_size * n_obs_steps, self.config.action_chunk_size, -1)
                     vq_action_error = torch.mean(torch.abs(action_seq - decoded_action))
-                    
-                    total_loss += F.l1_loss(action_seq, predicted_action)
-                    return_dicts["loss"] = total_loss
+                    predicted_action =  pred_logit_and_offset["cbet_offsets"].reshape(batch_size * n_obs_steps, self.config.action_chunk_size, -1) + decoded_action
                     offset_action_error = torch.mean(torch.abs(action_seq - predicted_action))
                     return_dicts["vq_action_error"]= vq_action_error.detach().cpu().item()
                     return_dicts["offset_action_error"]= offset_action_error.detach().cpu().item()
@@ -427,7 +425,7 @@ class VQBeTHead(nn.Module):
         self.map_to_cbet_preds_offset = MLP(
             in_channels=config.gpt_output_dim,
             hidden_channels=[
-                self.config.vqvae_n_embed * config.action_chunk_size * config.output_shapes["action"][0],
+                config.action_chunk_size * config.output_shapes["action"][0],
             ],
         )
         # init vqvae
@@ -448,9 +446,9 @@ class VQBeTHead(nn.Module):
 
         # sample offsets
         cbet_offsets = self.map_to_cbet_preds_offset(x)
-        cbet_offsets = einops.rearrange(
-            cbet_offsets, "(NT) (C WA) -> (NT) C WA", C=self.config.vqvae_n_embed
-        )
+        # cbet_offsets = einops.rearrange(
+        #     cbet_offsets, "(NT) (G C WA) -> (NT) G C WA", G=self.config.vqvae_groups, C=self.config.vqvae_n_embed
+        # )
         # if self.config.sequentially_select is True, bin prediction head first sample the primary code, and then sample secondary code
         if self.config.sequentially_select:
             cbet_primary_logits = self.map_to_cbet_preds_primary_bin(x)
@@ -490,15 +488,16 @@ class VQBeTHead(nn.Module):
             NT, choices = cbet_probs.shape
             sampled_centers = torch.multinomial(cbet_probs.view(-1, choices), num_samples=1)
             
-            device = get_device_from_parameters(self)
-            indices = (
-                torch.arange(NT, device=device).unsqueeze(1),
-                sampled_centers,
-            )
-            # Use advanced indexing to sample the values (Extract the only offsets corresponding to the sampled codes.)
-            sampled_offsets = cbet_offsets[indices]
-            # Then, sum the offsets over the RVQ layers to get a net offset for the bin prediction
-            # sampled_offsets = sampled_offsets.sum(dim=1)
+        # device = get_device_from_parameters(self)
+        # indices = (
+        #     torch.arange(NT, device=device).unsqueeze(1),
+        #     torch.arange(self.config.vqvae_groups, device=device).unsqueeze(0),
+        #     sampled_centers,
+        # )
+        # # Use advanced indexing to sample the values (Extract the only offsets corresponding to the sampled codes.)
+        # sampled_offsets = cbet_offsets[indices]
+        # # Then, sum the offsets over the RVQ layers to get a net offset for the bin prediction
+        # sampled_offsets = sampled_offsets.sum(dim=1)
         # with torch.no_grad():
         #     # Get the centroids (= vectors corresponding to the codes) of each layer to pass it through RVQ decoder
         #     return_decoder_input = self.vqvae_model.get_embeddings_from_code(sampled_centers).clone().detach()
@@ -526,7 +525,6 @@ class VQBeTHead(nn.Module):
             "cbet_logits": cbet_logits,
             "sampled_centers": sampled_centers,
             "cbet_offsets": cbet_offsets, 
-            "sampled_offsets": sampled_offsets,
         }
 
     def loss_fn(self, pred, target, **kwargs):
