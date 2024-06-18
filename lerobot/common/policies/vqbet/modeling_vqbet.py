@@ -365,6 +365,7 @@ class VQBeTModel(nn.Module):
                     predicted_action =  pred_logit_and_offset["cbet_offsets"].reshape(batch_size, n_obs_steps, self.config.action_chunk_size, -1) + decoded_action.reshape(batch_size, n_obs_steps, self.config.action_chunk_size, -1)
                     return predicted_action[:, -1, :, :]
                 else:
+                    ########################################## option 1 ##########################################
                     total_loss += F.l1_loss(reqired_offset, pred_logit_and_offset["cbet_offsets"]) * 100
                     return_dicts = {"loss": total_loss}
                     for i in range(self.config.vqvae_groups):
@@ -373,6 +374,23 @@ class VQBeTModel(nn.Module):
                     # offset_action_error = torch.mean(torch.abs(reqired_offset - pred_logit_and_offset["cbet_offsets"]))
                     return_decoder_input = self.action_head.vqvae_model.get_embeddings_from_code(sampled_centers_stack.long()).clone().detach() # (batch x obs_step, d)
                     decoded_action = (self.action_head.vqvae_model.get_action_from_latent(return_decoder_input).clone().detach())
+                    ################################################################################################
+
+
+
+
+                    ########################################## option 2 ##########################################
+                    # return_decoder_input = self.action_head.vqvae_model.get_embeddings_from_code(sampled_centers_stack.long()).clone().detach() # (batch x obs_step, d)
+                    # decoded_action = (self.action_head.vqvae_model.get_action_from_latent(return_decoder_input).clone().detach())
+                    # predicted_action =  pred_logit_and_offset["cbet_offsets"].reshape(batch_size * n_obs_steps, self.config.action_chunk_size, -1) + decoded_action.reshape(batch_size * n_obs_steps, self.config.action_chunk_size, -1)
+
+                    # total_loss += F.l1_loss(action_seq, predicted_action) * 100
+                    # return_dicts = {"loss": total_loss}
+                    # for i in range(self.config.vqvae_groups):
+                    #     return_dicts["equal_code_rate_{}th".format(i)] = equal_code_rate[i].detach().cpu().item()
+                    ################################################################################################
+
+
                     # decoded_action = decoded_action.reshape(batch_size * n_obs_steps, self.config.action_chunk_size, -1)
                     vq_action_error = torch.mean(torch.abs(action_seq - decoded_action))
                     predicted_action =  pred_logit_and_offset["cbet_offsets"].reshape(batch_size * n_obs_steps, self.config.action_chunk_size, -1) + decoded_action
@@ -425,7 +443,7 @@ class VQBeTHead(nn.Module):
         self.map_to_cbet_preds_offset = MLP(
             in_channels=config.gpt_output_dim,
             hidden_channels=[
-                config.action_chunk_size * config.output_shapes["action"][0],
+                config.action_chunk_size * config.output_shapes["action"][0], # 256
             ],
         )
         # init vqvae
