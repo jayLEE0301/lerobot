@@ -16,19 +16,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import math
+import pathlib
 import warnings
 from collections import deque
-from typing import Callable, List
+from typing import Callable, Iterable, List, Optional, Tuple, Union
 
 import einops
 import numpy as np
+import timm
 import torch
 import torch.nn.functional as F  # noqa: N812
 import torchvision
 from huggingface_hub import PyTorchModelHubMixin
+from timm.data.random_erasing import RandomErasing
 from torch import Tensor, nn
 from torch.optim.lr_scheduler import LambdaLR
+from torchvision import transforms
+from torchvision.transforms import InterpolationMode
 
 from lerobot.common.policies.normalize import Normalize, Unnormalize
 from lerobot.common.policies.utils import get_device_from_parameters, populate_queues
@@ -36,6 +42,201 @@ from lerobot.common.policies.vqbet.configuration_vqbet import VQBeTConfig
 from lerobot.common.policies.vqbet.vqbet_utils import GPT, ResidualVQ
 
 # ruff: noqa: N806
+
+
+def create_transform(
+    input_size,
+    is_training: bool = False,
+    scale: Optional[Tuple[float, float]] = None,
+    ratio: Optional[Tuple[float, float]] = None,
+    hflip: float = 0.5,
+    vflip: float = 0.0,
+    grayscale: float = 0.0,
+    gaussblr: float = 0.0,
+    gaussblr_kernel: int = 3,
+    gaussblr_sigma: tuple = (1.0, 2.0),
+    color_jitter: Optional[Union[Iterable[float], float]] = 0.4,
+    interpolation: Union[str, InterpolationMode] = "bilinear",
+    mean: Union[Iterable, torch.Tensor] = (0.485, 0.456, 0.406),
+    std: Union[Iterable, torch.Tensor] = (0.229, 0.224, 0.225),
+    re_prob=0.0,
+    re_mode="const",
+    re_count=1,
+    re_num_splits=0,
+    crop_pct=None,
+    crop_mode=None,
+    *args,
+    **kwargs,
+):
+    img_size = input_size[-2:] if isinstance(input_size, (tuple, list)) else input_size
+    transform_list = []
+
+    interpolation_mode = InterpolationMode.BILINEAR
+    try:
+        interpolation_mode = InterpolationMode[interpolation.upper()]
+    except AttributeError:
+        logging.warning(f"Interpolation mode {interpolation} is not recognized, " f"using bilinear instead.")
+    if is_training:
+        scale = tuple(scale or (0.08, 1.0))  # default imagenet scale range
+        ratio = tuple(ratio or (3.0 / 4.0, 4.0 / 3.0))  # default imagenet ratio range
+
+        transform_list.append(
+            transforms.RandomResizedCrop(
+                img_size,
+                scale,
+                ratio,
+                antialias=False,
+                interpolation=interpolation_mode,
+            )
+        )
+        if hflip > 0.0:
+            transform_list.append(transforms.RandomHorizontalFlip(hflip))
+        if vflip > 0.0:
+            transform_list.append(transforms.RandomVerticalFlip(vflip))
+
+        if color_jitter is not None:
+            if isinstance(color_jitter, (list, tuple)):
+                assert len(color_jitter) in (
+                    3,
+                    4,
+                ), "expected either 3 or 4 values for color jitter"
+            else:
+                color_jitter = (float(color_jitter),) * 3
+            transform_list.append(transforms.ColorJitter(*color_jitter))
+
+        if grayscale > 0.0:
+            transform_list.append(transforms.RandomGrayscale(p=grayscale))
+        if gaussblr > 0.0:
+            transform_list.append(
+                transforms.RandomApply(
+                    [transforms.GaussianBlur((gaussblr_kernel, gaussblr_kernel), gaussblr_sigma)],
+                    p=gaussblr,
+                )
+            )
+        transform_list.append(transforms.Normalize(mean, std))
+
+        if re_prob > 0.0:
+            transform_list.append(
+                RandomErasing(
+                    re_prob,
+                    mode=re_mode,
+                    max_count=re_count,
+                    num_splits=re_num_splits,
+                    device="cuda",
+                )
+            )
+
+    else:
+        if crop_pct is None:
+            crop_pct = 0.875
+        if crop_mode is None:
+            crop_mode = "center"
+        rescaled_size = (
+            int(img_size / crop_pct)
+            if isinstance(img_size, (int, float))
+            else ([int(size / crop_pct) for size in img_size])
+        )
+        transform_list.append(transforms.Resize(rescaled_size, interpolation_mode, antialias=False))
+        if crop_mode == "center":
+            transform_list.append(transforms.CenterCrop(img_size))
+        elif crop_mode == "random":
+            transform_list.append(transforms.RandomCrop(img_size))
+        else:
+            raise ValueError(f"crop_mode '{crop_mode}' not recognized")
+        transform_list.append(transforms.Normalize(mean, std))
+
+    return transforms.Compose(transform_list)
+
+
+class TimmModel(nn.Module):
+    def __init__(
+        self,
+        model_name: str = "hf-hub:notmahi/dobb-e",
+        pretrained: bool = True,
+        weight_path: Union[None, str, pathlib.Path] = None,
+    ):
+        super().__init__()
+        self._model_name = model_name
+
+        self.model = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
+        if weight_path:
+            self.load_weights(weight_path, strict=False)
+
+    def transform(self, x):
+        return x
+
+    @property
+    def feature_dim(self):
+        return self.model.num_features
+
+    def to(self, device):
+        self.model.to(device)
+        return self
+
+    def forward(self, x):
+        return self.model(self.transform(x))
+
+    def load_weights(self, weight_path: Union[pathlib.Path, str], strict: bool = True) -> bool:
+        try:
+            weight_dict = torch.load(weight_path, map_location="cpu")["model"]
+            self.model.load_state_dict(weight_dict, strict=strict)
+        except RuntimeError:
+            warnings.warn("Couldn't load weights from file, trying to load encoder only", stacklevel=2)
+            try:
+                enc_weights_filtered = {
+                    k.replace("model.", ""): v for k, v in weight_dict.items() if k.startswith("model.")
+                }
+                self.model.load_state_dict(enc_weights_filtered, strict=strict)
+            except RuntimeError:
+                warnings.warn(
+                    "Couldn't load weights from file, trying to filter for encoder weights", stacklevel=2
+                )
+                enc_weights_filtered = {
+                    k.replace("encoder.", ""): v for k, v in weight_dict.items() if k.startswith("encoder.")
+                }
+                self.model.load_state_dict(enc_weights_filtered, strict=strict)
+        except Exception as e:
+            warnings.warn(
+                f"Could not load encoder weights: defaulting to pretrained weights. Error: {str(e)}",
+                stacklevel=2,
+            )
+
+
+class TimmSSL(TimmModel):
+    def __init__(
+        self,
+        model_name: str = "hf-hub:notmahi/dobb-e",
+        pretrained=True,
+        override_aug_kwargs=None,
+        weight_path: Union[None, str, pathlib.Path] = None,
+    ):
+        if override_aug_kwargs is None:
+            override_aug_kwargs = {"hflip": 0.0, "vflip": 0.0, "scale": (1.0, 1.0), "crop_pct": 0.875}
+        super().__init__(model_name, pretrained=pretrained)
+        data_cfg = timm.data.resolve_data_config(self.model.pretrained_cfg)
+        # Now define the transforms.
+        data_cfg.update(override_aug_kwargs)
+        data_cfg["is_training"] = True
+        self._train_transform = create_transform(**data_cfg)
+        data_cfg["is_training"] = False
+        self._test_transform = create_transform(**data_cfg)
+        if weight_path is not None:
+            self.load_weights(weight_path, strict=True)
+
+    def transform(self, x):
+        return self._train_transform(x) if self.model.training else self._test_transform(x)
+
+    def forward(self, x):
+        # Split the input into frames and labels.
+        # images, *labels = x
+        # # Flatten the frames into a single batch.
+        # flattened_images = einops.rearrange(images, "b t c h w -> (b t) c h w")
+        # Transform and pass through the model.
+        x = self.transform(x)
+        result = self.model(x)
+        # Unflatten the result.
+        # result = einops.rearrange(result, "(b t) c -> b t c", b=x.shape[0])
+        return result
 
 
 class VQBeTPolicy(nn.Module, PyTorchModelHubMixin):
@@ -281,7 +482,12 @@ class VQBeTModel(nn.Module):
         super().__init__()
         self.config = config
 
-        self.rgb_encoder = VQBeTRgbEncoder(config)
+        if config.vision_backbone == "resnet18":
+            self.rgb_encoder = VQBeTRgbEncoder(config)
+        elif config.vision_backbone == "dobb-e":
+            self.rgb_encoder = TimmSSL()
+            for param in self.rgb_encoder.parameters():
+                param.requires_grad = True
         self.num_images = len([k for k in config.input_shapes if k.startswith("observation.image")])
         # This action query token is used as a prompt for querying action chunks. Please refer to "A_Q" in the image above.
         # Note: During the forward pass, this token is repeated as many times as needed. The authors also experimented with initializing the necessary number of tokens independently and observed inferior results.

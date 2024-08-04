@@ -76,7 +76,7 @@ policy:
 
   # Architecture / modeling.
   # Vision backbone.
-  vision_backbone: resnet18
+  vision_backbone: dobb-e
   crop_shape: [84, 84]
   crop_is_random: True
   pretrained_backbone_weights: null

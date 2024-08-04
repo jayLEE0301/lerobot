@@ -126,5 +126,5 @@ wandb:
   enable: false
   # Set to true to disable saving an artifact despite save_checkpoint == True
   disable_artifact: false
-  project: lerobot
+  project: lerobot_dobbe
   notes: ""
